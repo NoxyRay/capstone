@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -16,10 +16,39 @@ interface TicketDetailProps {
 
 export default function TicketDetail({ ticketId, onBack, isUserView = false }: TicketDetailProps) {
     const [newMessage, setNewMessage] = useState('');
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [sseError, setSseError] = useState<string | null>(null);
 
-    const { tickets: ticket } = useFetchTickets(ticketId);
+    const { tickets: ticket, error: ticketError } = useFetchTickets(ticketId);
+    const { progressLogs, mutate: mutateProgressLogs, error: logsError } = useFetchProgressLogs(ticketId);
 
-    const { progressLogs, mutate: mutateProgressLogs } = useFetchProgressLogs(ticketId);
+    // SSE implementation for real-time updates
+    useEffect(() => {
+        const eventSource = new EventSource(`/api/tickets/${ticketId}/updates`);
+
+        eventSource.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            if (data.type === 'new_message' || data.type === 'status_update') {
+                mutateProgressLogs();
+            }
+        };
+
+        eventSource.onerror = (error) => {
+            console.error('SSE Error:', error);
+            setSseError('Connection interrupted. Trying to reconnect...');
+            eventSource.close();
+            
+            // Attempt to reconnect after 5 seconds
+            setTimeout(() => {
+                setSseError(null);
+                mutateProgressLogs(); // Manual refresh as fallback
+            }, 5000);
+        };
+
+        return () => {
+            eventSource.close();
+        };
+    }, [ticketId, mutateProgressLogs]);
 
     const getPriorityColor = (priority: string) => {
         switch (priority) {
@@ -41,8 +70,10 @@ export default function TicketDetail({ ticketId, onBack, isUserView = false }: T
     };
 
     const handleSendMessage = async () => {
-        if (!newMessage.trim()) return; // mencegah kirim pesan kosong
+        if (!newMessage.trim() || isSubmitting) return;
 
+        setIsSubmitting(true);
+        
         try {
             const res = await fetch("/api/progress-logs", {
                 method: "POST",
@@ -51,23 +82,21 @@ export default function TicketDetail({ ticketId, onBack, isUserView = false }: T
                 },
                 body: JSON.stringify({
                     note: newMessage,
-                    ticket_id: ticketId,  // pastikan ini ada
-                    user_id: ticket?.customer?.id,       // pastikan ini ada
+                    ticket_id: ticketId,
+                    user_id: ticket?.customer?.id,
                 }),
             });
 
             if (!res.ok) {
-                console.error("Gagal mengirim pesan");
-                return;
+                throw new Error("Failed to send message");
             }
 
-            const data = await res.json();
-            console.log("Berhasil kirim:", data);
-            setNewMessage(""); // reset textarea
-            mutateProgressLogs()
-            // 🔁 opsional: panggil mutate / refetch untuk refresh log terbaru
+            setNewMessage("");
+            await mutateProgressLogs();
         } catch (error) {
-            console.error("Error mengirim pesan:", error);
+            console.error("Error sending message:", error);
+        } finally {
+            setIsSubmitting(false);
         }
     };
 
@@ -78,16 +107,44 @@ export default function TicketDetail({ ticketId, onBack, isUserView = false }: T
         }
     };
 
+    if (ticketError || logsError) {
+        return (
+            <div className="max-w-6xl mx-auto space-y-6 p-6">
+                <Button variant="outline" size="sm" onClick={onBack}>Back</Button>
+                <div className="bg-red-50 border border-red-200 rounded-lg p-6 text-center">
+                    <AlertTriangle className="h-10 w-10 mx-auto text-red-500 mb-4" />
+                    <h3 className="text-lg font-medium text-red-800 mb-2">Error loading ticket</h3>
+                    <p className="text-red-600">{ticketError?.message || logsError?.message}</p>
+                </div>
+            </div>
+        );
+    }
+
+    if (!ticket) {
+        return (
+            <div className="max-w-6xl mx-auto space-y-6 p-6">
+                <Button variant="outline" size="sm" onClick={onBack}>Back</Button>
+                <div className="flex justify-center items-center h-64">
+                    <div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-blue-500"></div>
+                </div>
+            </div>
+        );
+    }
+
     return (
         <div className="max-w-6xl mx-auto space-y-6">
+            <Button variant="outline" size="sm" onClick={onBack}>Back</Button>
+            
+            {sseError && (
+                <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 flex items-center gap-3">
+                    <AlertTriangle className="h-5 w-5 text-yellow-600" />
+                    <span className="text-yellow-800 text-sm">{sseError}</span>
+                </div>
+            )}
 
-            <Button variant="outline" size="sm"
-                onClick={onBack}
-            >Back
-            </Button>
             <div className="flex items-center justify-between items-center">
                 <div>
-                    <p className=" text mb-1 font-medium ">TK-{ticket.id}-{new Date(ticket.created_at).toLocaleDateString("en-GB", {
+                    <p className="text mb-1 font-medium">TK-{ticket.id}-{new Date(ticket.created_at).toLocaleDateString("en-GB", {
                         year: "2-digit",
                         month: "2-digit",
                     }).replace("/", "-")}</p>
@@ -100,21 +157,18 @@ export default function TicketDetail({ ticketId, onBack, isUserView = false }: T
                         </div>
                         <div className="flex items-center gap-1">
                             <IconUser className="h-4 w-4" />
-                            <span>Engineer: {ticket.engineer?.name}</span>
+                            <span>Engineer: {ticket.engineer?.name || 'Unassigned'}</span>
                         </div>
                     </div>
                 </div>
                 <div className="flex items-center gap-3">
                     {ticket?.priority && ticket?.priority?.name && (
-
                         <Badge className={`${getPriorityColor(ticket.priority?.name)} px-4 py-2 text-sm font-semibold shadow-lg`}>
-                            {/* <AlertTriangle className="h-4 w-4 mr-2" /> */}
                             {ticket.priority?.name.charAt(0).toUpperCase() + ticket.priority?.name.slice(1)}
                         </Badge>
                     )}
                     {ticket?.status && ticket?.status?.name && (
                         <Badge className={`${getStatusColor(ticket.status?.name)} px-4 py-2 text-sm font-semibold shadow-lg`}>
-                            {/* <Shield className="h-4 w-4 mr-2" /> */}
                             {ticket.status?.name.replace('-', ' ').replace(/\b\w/g, l => l.toUpperCase())}
                         </Badge>
                     )}
@@ -139,13 +193,9 @@ export default function TicketDetail({ ticketId, onBack, isUserView = false }: T
                     {/* Messages Area */}
                     <CardContent className="flex-1 p-0 overflow-hidden flex flex-col">
                         <div className="flex-1 overflow-y-auto p-6 space-y-6 bg-gradient-to-b from-gray-50/50 to-white">
-                            <div
-                                className={`flex justify-end animate-fade-in`}
-                            >
+                            <div className={`flex justify-end animate-fade-in`}>
                                 <div className={`max-w-[85%] order-1`}>
-                                    <div
-                                        className={`p-5 rounded-3xl shadow-lg backdrop-blur-sm transition-all duration-200 hover:shadow-xl bg-gradient-to-r from-blue-500 via-purple-500 to-indigo-500 text-white rounded-tr-lg mr-4`}
-                                    >
+                                    <div className={`p-5 rounded-3xl shadow-lg backdrop-blur-sm transition-all duration-200 hover:shadow-xl bg-gradient-to-r from-blue-500 via-purple-500 to-indigo-500 text-white rounded-tr-lg mr-4`}>
                                         <div className="flex items-center gap-2 mb-3">
                                             <div className={`p-1.5 rounded-full bg-white/20`}>
                                                 <User className={`h-4 w-4 text-white`} />
@@ -180,13 +230,13 @@ export default function TicketDetail({ ticketId, onBack, isUserView = false }: T
                                             <div className="flex items-center gap-2 mb-3">
                                                 <div className={`p-1.5 rounded-full ${message.user?.role === 'Engineer' ? 'bg-blue-100' : 'bg-white/20'}`}>
                                                     {message.user?.role === 'Engineer' ? (
-                                                        <Shield className="h-4 w-4 text-white" />
+                                                        <Shield className="h-4 w-4 text-blue-600" />
                                                     ) : (
-                                                        <User className={`h-4 w-4 ${message.user?.role === 'Engineer' ? 'text-blue-600' : 'text-white'}`} />
+                                                        <User className={`h-4 w-4 text-white`} />
                                                     )}
                                                 </div>
                                                 <span className="text-sm font-semibold">
-                                                    {message.user?.role === 'Engineer' ? message?.user?.name : `${message?.user?.name} (Engineer)`}
+                                                    {message.user?.role === 'Engineer' ? `${message?.user?.name} (Engineer)` : `${message?.user?.name}`}
                                                 </span>
                                             </div>
                                             <p className="text-sm leading-relaxed mb-3">{message.note}</p>
@@ -212,12 +262,21 @@ export default function TicketDetail({ ticketId, onBack, isUserView = false }: T
                                     onChange={(e) => setNewMessage(e.target.value)}
                                     onKeyPress={handleKeyPress}
                                     className="flex-1 min-h-[60px] max-h-[120px] resize-none border-0 bg-white shadow-lg rounded-2xl p-4 focus:ring-2 focus:ring-blue-500/20 transition-all duration-200"
+                                    disabled={isSubmitting}
                                 />
                                 <Button
                                     onClick={handleSendMessage}
-                                    className="bg-gradient-to-r from-blue-500 via-purple-500 to-indigo-500 hover:from-blue-600 hover:via-purple-600 hover:to-indigo-600  rounded-full transition-all duration-200 text-white font-semibold"
+                                    className="bg-gradient-to-r from-blue-500 via-purple-500 to-indigo-500 hover:from-blue-600 hover:via-purple-600 hover:to-indigo-600 rounded-full transition-all duration-200 text-white font-semibold"
+                                    disabled={isSubmitting || !newMessage.trim()}
                                 >
-                                    <Send className="h-5 w-5" />
+                                    {isSubmitting ? (
+                                        <svg className="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                        </svg>
+                                    ) : (
+                                        <Send className="h-5 w-5" />
+                                    )}
                                 </Button>
                             </div>
                         </div>
